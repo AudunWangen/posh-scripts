@@ -1,4 +1,4 @@
-# OutlookSignatureScript.ps1 v1.1 (c) Chris Redit
+# OutlookSignatureScript.ps1 v1.3 (c) Chris Redit
 
 ## README
 # The commented variables below are used to configure the script.
@@ -11,6 +11,12 @@ $TemplatePath = '\\example.com\NETLOGON\Signatures'
 $UpdateThreashold = (24*60)
 # Registry key name for storing settings under the users profile, default 'OutlookSignatureScript'.
 $SettingsKeyName = 'OutlookSignatureScript'
+# Enable alternate method for discovering the 'Signature' folder name, this will search the Local Machine registry location, default $false.
+$EnableMachineSignatureFolderName = $false
+# Enable deletion of lines in a signature template which contain an empty tag, occurs when a property in Active Directory is not populated for a user, default $false.
+$EnableDeleteEmptyTagLine = $false
+# Enable "mailto:" formatting for email addresses, default $true.
+$EnableMailToLink = $true
 # Enable the log file (for event log logging a source named 'OutlookSignature' must be registered), default $false
 $EnableLogFile = $false
 # Path to write the log file to, default is 'AppData\Local\OutlookSignatureScript'.
@@ -94,7 +100,7 @@ try
     
     # defines whether there is a prompt for choosing Outlook profile at launch, 0 = no prompt, 1 = prompt
     $PickLogonProfile = (Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Exchange\Client\Options' -EA SilentlyContinue).PickLogonProfile
-    if ($PickLogonProfile -eq $null)
+    if ($null -eq $PickLogonProfile)
     {
         # if Outlook profile options have never been changed the reg key will not exisit and the setting is effectivly 0
         $PickLogonProfile = 0
@@ -110,15 +116,36 @@ try
         $OutlookDefaultProfile = $true
     }
     
-    # get the localised name for the "Signatures" folder and build the path
-    if ($OutlookVersion -eq 16)
-	{
-		$SignatureFolderName = (Get-ItemProperty -Path "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office\$OutlookVersion.0\User Settings\Mso_CoreReg\Create\Software\Microsoft\Office\$OutlookVersion.0\Common\General").Signatures
-	}
-    else
+    # get the localised name for the "Signatures" folder from user profile registry location
+    $SignatureFolderName = (Get-ItemProperty -Path "HKCU:\Software\Microsoft\Office\$OutlookVersion.0\Common\General").Signatures
+    
+    if ($EnableMachineSignatureFolderName)
     {
-	$SignatureFolderName = (Get-ItemProperty -Path "HKCU:\Software\Microsoft\Office\$OutlookVersion.0\Common\General").Signatures
+        # In some cases the localised name of the "Signatures" folder is set at a local machine registry location,
+        # this may be when Windows and Office were installed/configured with different language settings.
+        $MachineSignatureFolderName64 = (Get-ItemProperty -Path `
+            "HKLM:\SOFTWARE\Microsoft\Office\$OutlookVersion.0\User Settings\Mso_CoreReg\Create\Software\Microsoft\Office\14.0\Common\General"
+        ).Signatures
+        
+        $MachineSignatureFolderName32 = (Get-ItemProperty -Path `
+            "HKLM:\SOFTWARE\Wow6432Node\Microsoft\Office\$OutlookVersion.0\User Settings\Mso_CoreReg\Create\Software\Microsoft\Office\14.0\Common\General"
+        ).Signatures
+        
+        if ($null -ne $MachineSignatureFolderName64)
+        {
+            $SignatureFolderName = $MachineSignatureFolderName64
+        }
+        elseif ($null -ne $MachineSignatureFolderName32)
+        {
+            $SignatureFolderName = $MachineSignatureFolderName32
+        }
     }
+    
+    if ($null -eq $SignatureFolderName)
+    {
+        throw '"Signature" folder name not found, use $EnableMachineSignatureFolderName to try an alternative method.'
+    }
+    
     $OutlookSignaturePath = $env:APPDATA+'\Microsoft\'+$SignatureFolderName
     
     $Events = [System.Collections.ArrayList]@()
@@ -205,7 +232,7 @@ try
             Copy-Item -Path $File.FullName -Destination (Join-Path -Path $OutlookSignaturePath -ChildPath $TemplateFileName) -Force -EA Stop
             
             # create word.exe process if one is not already running
-            if ($Word -eq $null)
+            if ($null -eq $Word)
             {
                 $Word = New-Object -TypeName 'Microsoft.Office.Interop.Word.ApplicationClass'
             }
@@ -226,27 +253,46 @@ try
                 try
                 {
                     # add "mailto:" hyperlink for the email address field
-                    if ($Tag.Value -eq '{mail}' -or $Tag.Value -eq '{emailAddress}')
+                    if ($Tag.Value -eq '{mail}' -or $Tag.Value -eq '{emailAddress}' -and $EnableMailToLink -eq $true)
                     {
                         $Word.Selection.Find.Execute($Tag.Value) | Out-Null
                         $Word.ActiveDocument.Hyperlinks.Add($Word.Selection.Range, 'mailto:'+$User.mail.ToString(), $null, $null, $User.mail.ToString(), $null) | Out-Null
                     }
                     else
                     {
-                        # https://msdn.microsoft.com/en-us/library/office/microsoft.office.interop.word.find.execute.aspx
-                        $Word.Selection.Find.Execute(
-                            $Tag.Value, # FindText string
-                            $false,     # MatchCase bool
-                            $true,      # MatchWholeWord bool
-                            $false,     # MatchWildcards bool
-                            $false,     # MatchSoundsLike bool
-                            $false,     # MatchAllWordForms bool
-                            $true,      # Forward bool
-                            [Microsoft.Office.Interop.Word.WdFindWrap]::wdFindContinue, # Wrap enum
-                            $false,     # Format bool
-                            $User.($Tag.Groups[1].Value).ToString(),                    # ReplaceWith string
-                            [Microsoft.Office.Interop.Word.WdReplace]::wdReplaceOne     # Replace enum
-                        ) | Out-Null
+                        $UserPropertyValue = $User.($Tag.Groups[1].Value).ToString()
+                        if ($UserPropertyValue -eq '' -and $EnableDeleteEmptyTagLine -eq $true)
+                        {
+                            # https://msdn.microsoft.com/en-us/library/office/microsoft.office.interop.word.find.execute.aspx
+                            $Word.Selection.Find.Execute(
+                                $Tag.Value, # FindText string
+                                $false,     # MatchCase bool
+                                $true,      # MatchWholeWord bool
+                                $false,     # MatchWildcards bool
+                                $false,     # MatchSoundsLike bool
+                                $false,     # MatchAllWordForms bool
+                                $true,      # Forward bool
+                                [Microsoft.Office.Interop.Word.WdFindWrap]::wdFindContinue # Wrap enum
+                            ) | Out-Null
+                            $Word.Selection.Expand([Microsoft.Office.Interop.Word.WdUnits]::wdLine)
+                            $Word.Selection.Delete()
+                        }
+                        else
+                        {
+                            $Word.Selection.Find.Execute(
+                                $Tag.Value, # FindText string
+                                $false,     # MatchCase bool
+                                $true,      # MatchWholeWord bool
+                                $false,     # MatchWildcards bool
+                                $false,     # MatchSoundsLike bool
+                                $false,     # MatchAllWordForms bool
+                                $true,      # Forward bool
+                                [Microsoft.Office.Interop.Word.WdFindWrap]::wdFindContinue, # Wrap enum
+                                $false,     # Format bool
+                                $UserPropertyValue,                                     # ReplaceWith string
+                                [Microsoft.Office.Interop.Word.WdReplace]::wdReplaceOne # Replace enum
+                            ) | Out-Null
+                        }
                     }
                 }
                 catch
@@ -360,7 +406,7 @@ $EventText
     Write-Host $LogText
     Write-Log $LogText -EventId 1944
     
-    if ($Word -ne $null)
+    if ($null -eq $Word)
     {
         # quit Word process if it was created and release from memory
         $Word.Quit() | Out-Null
